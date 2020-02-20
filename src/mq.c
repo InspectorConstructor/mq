@@ -106,6 +106,7 @@ static struct argp_option options[] = {
 	{ 0, 0, 0, 0, "Options for send, recv:" },
 	{ "non-blocking", 'n', 0, 0, "Do not block (send, recv)" },
 	{ "delimiter", 'd', "CHAR", 0, "Character to delimit the end of messages (see delimiters)" },
+	{ "read-stdin", 'i', 0, 0, "Read message from stdin as space-separated hex-encoded ascii-string." },
 	{ 0 }
 };
 
@@ -122,6 +123,9 @@ struct arguments
 	char delimiter;
 
 	int timestamp;
+
+	int readstdin; /* read message from stdin as a hex-encoded string */
+
 	/* for command 'recv' */
 	int blocking;
 	int follow;
@@ -152,6 +156,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 			return ARGP_ERR_UNKNOWN;
 		}
 		break;
+	case 'i': args->readstdin = 1; break;
 
 	case ARGP_KEY_NO_ARGS:
 		argp_usage(state);
@@ -172,7 +177,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case ARGP_KEY_END:
 		if (!args->command) argp_usage(state);
 		if (!args->qname) argp_usage(state);
-		if (0 == strcmp(args->command, "send") && !args->message) argp_usage(state);
+		if (0 == strcmp(args->command, "send") && !(args->message || args->readstdin)) argp_usage(state);
 		return ARGP_ERR_UNKNOWN;
 
 	default:
@@ -239,28 +244,114 @@ static int cmd_unlink(const struct arguments *args)
 	return 0;
 }
 
+#include <ctype.h>
+
+//#define TEST
 static int cmd_send(const struct arguments *args)
 {
-	int oflag = O_WRONLY;
-	if (!args->blocking) oflag |= O_NONBLOCK;
-
-	LOG_VERBOSE(args, "Opening mq %s (O_WRONLY%s)", args->qname, (oflag & O_NONBLOCK)?", O_NONBLOCK":"");
-	mqd_t queue = mq_open(args->qname, oflag);
-	if (-1 == queue) {
-		LOG_ERR("mq_open error: %s", strerror(errno));
-		return 1;
-	}
-
-	LOG_VERBOSE_HEXA(args, (const uint8_t *)args->message, args->msglen);
+    char *theMessage = NULL;
+    size_t theMessageSize = 0;
 
 	/* Send */
-	int ret = mq_send(queue, args->message, args->msglen, args->priority);
-	if (0 != ret) {
-		LOG_ERR("mq_send error: %s", strerror(errno));
-		ret = 1;
-	}
+    int ret = 0;
+    if (args->readstdin)
+    {
+        FILE* f;
+#ifdef TEST
+        LOG_VERBOSE(args, "Using test file test_input");
+        f = fopen("test_input", "r");
+        if (f == NULL)
+            return 1;
+#else
+        f = stdin;
+#endif
+        size_t bytes_decoded = 0;
+        size_t max_msg_size = args->msglen;
+        char *msg = calloc(1, max_msg_size);
+        size_t buflen = 0;
+        char buf[3];
+        memset(buf, 0, sizeof(buf));
+        int c;
 
-	mq_close(queue);
+        for (c = fgetc(f); c != EOF ; c = fgetc(f))
+        {
+            int canProcess = 0;
+            if (isspace(c))
+            {
+                if (buflen)
+                {
+                    canProcess = 1;
+                }
+            }
+            else if (isxdigit(c))
+            {
+                buf[buflen] = (char) c;
+                buflen += 1;
+
+                if (buflen >= 2)
+                {
+                    canProcess = 1;
+                }
+            }
+            else
+            {
+                continue;
+            }
+
+            if (canProcess)
+            {
+                unsigned int b;
+                sscanf(buf, "%x", &b);
+                msg[bytes_decoded] = (char)b & 0xFF;
+                bytes_decoded += 1;
+                buflen = 0;
+                memset(buf, 0, sizeof(buf));
+                if (bytes_decoded + 1 == max_msg_size)
+                    break;
+            }
+        }
+#ifdef TEST
+        fclose(f);
+#endif
+        if (buflen)
+        {
+            unsigned int b;
+            sscanf(buf, "%x", &b);
+            msg[bytes_decoded] = (unsigned char)b & 0xFF;
+            bytes_decoded += 1;
+            buflen = 0;
+            memset(buf, 0, sizeof(buf));
+        }
+
+        theMessage = msg;
+        theMessageSize = bytes_decoded;
+    }
+    else
+    {
+        LOG_VERBOSE_HEXA(args, (const uint8_t *)args->message, args->msglen);
+        theMessage = args->message;
+        theMessageSize = args->msglen;
+    }
+
+    int oflag = O_WRONLY;
+    if (!args->blocking) oflag |= O_NONBLOCK;
+
+    LOG_VERBOSE(args, "Opening mq %s (O_WRONLY%s)", args->qname, (oflag & O_NONBLOCK)?", O_NONBLOCK":"");
+    mqd_t queue = mq_open(args->qname, oflag);
+    if (-1 == queue) {
+        LOG_ERR("mq_open error: %s", strerror(errno));
+        return 1;
+    }
+    ret = mq_send(queue, theMessage, theMessageSize, args->priority);
+    if (0 != ret) {
+        LOG_ERR("mq_send error: %s", strerror(errno));
+        ret = 1;
+    }
+    mq_close(queue);
+
+    if (args->readstdin)
+        free(theMessage);
+
 	return ret;
 }
 
@@ -381,6 +472,7 @@ int main(int argc, char **argv)
 	args.maxmsg = 10;
 	args.msgsize = 1024;
 	args.timestamp = 0;
+	args.readstdin = 0;
 	args.blocking = 1;
 	args.follow = 0;
 	args.message = NULL;
